@@ -1,0 +1,413 @@
+我看完一遍了，大概帮你梳理一下当前逻辑，顺便把几处明显可疑的地方标出来，后面你要改/查 bug 会方便很多。
+
+---
+
+## 整体结构是啥？
+
+这是一个 **状态机驱动的双人对战游戏主程序**：
+
+* **输入：**
+
+  * 玩家1：PS/2 键盘（通过 `ps2key_extiInit()` + EXTI11）
+  * 玩家2：USART2 收数据（`USART_FOR_MULTIPLAYER` 那套 ring buffer）
+
+* **显示：**
+
+  * LCD（前页、说明页、战斗场景、HP、计时器、胜负画面）
+
+* **计时：**
+
+  * TIM2 定时中断，每秒刷新一次倒计时 `time`（单位是 10 秒）
+
+* **状态机 `status`：**
+
+  * `0`：前页面（home）
+  * `1`：说明页面（info）
+  * `2`：开始游戏的初始化阶段
+  * `3`：战斗中
+  * `4`：Game Over
+  * `5`：暂停
+
+还有一个 `last_status` 用来判断要不要重新绘制页面。
+
+---
+
+## main() 里各个 status 做什么？
+
+### status == 0：前页
+
+```c
+if (status == 0) {
+    if(last_status != 0) {
+        DRAW_FRONT_PAGE();
+    }
+    last_status = 0;
+}
+```
+
+只在从别的状态切到 0 时画一次前页。
+
+---
+
+### status == 1：信息页
+
+```c
+else if (status == 1) {
+    if(last_status != 1) {
+        DRAW_INFO_PAGE();
+    }
+    last_status = 1;
+}
+```
+
+同理，只在进入时画一次说明页。
+
+---
+
+### status == 2：开始游戏初始化
+
+```c
+else if (status == 2) {
+    character1 = CREATE_CHARACTER_1();
+    character2 = CREATE_CHARACTER_2();
+    TASKS[0] = 3;
+    TASKS[1] = 3001;
+    TASKS[2] = 101;
+    TASKS[5] = 1;
+    lcd_fillRectangle(c_white, 0,240, 0, 320);
+    delay(10000000);
+    DRAW_ARENA();
+    DRAW_HP_VALUE(character1);
+    DRAW_HP_VALUE(character2);
+    HP_list_init(&hplist);
+    Bullet_list_init(&bulletlist1);
+    Bullet_list_init(&bulletlist2);
+    status = 3;
+    last_status = 2;
+}
+```
+
+* 创建两个角色
+* 初始化 TASKS（定时任务/事件驱动用）
+* 清屏、绘制竞技场和 HP
+* 初始化 HP 链表和子弹链表
+* 切换到 `status = 3`（战斗）
+
+---
+
+### status == 3：战斗状态（核心循环）
+
+```c
+else if (status == 3)
+{
+    tim2_init(7999, 8999);
+    while(1)
+    {
+        if(status != 3) { break; }
+
+        if(TASKS[0] == 1)
+        {
+            // 键盘 + 串口输入采集
+            ...
+            CHARACTER_MOVE_NEW(&character1, instruction1);
+            delay(100000);
+            CHARACTER_MOVE_NEW(&character2, instruction2);
+            delay(1000000);
+
+            if(player1_die_flag == 1 || player2_die_flag == 1) {
+                status = 4;
+            }
+
+            UPDATE_BULLET_STATUS(&character1, &character2);
+            HP_PACKS_FALLING();
+        }
+
+        if(TASKS[1] == 1) {
+            TASKS[1] = 3001;
+            INIT_HP_PACKS_DROP();
+        }
+
+        last_status = 3;
+        DS1_Off;
+        DS0_Off;
+    }
+}
+```
+
+* 进入战斗时启动 TIM2（每秒中断一次，下面会讲）
+
+* 在一个内层 `while(1)` 里根据 `TASKS[0]` 执行一帧逻辑：
+
+  * **玩家1**：从 PS/2 键盘 -> `instruction1`
+  * **玩家2**：从串口 RX ring buffer -> `instruction2`
+  * 根据 instruction 调用 `CHARACTER_MOVE_NEW`
+  * 更新 HP、子弹、掉落包等
+  * 死亡标志触发则把 `status` 设为 4，下一轮跳出 while
+
+* `TASKS[1]` 用来控制 HP 包掉落事件
+
+---
+
+### status == 4：Game Over
+
+```c
+else if (status == 4)
+{
+    if(last_status != 4)
+    {
+        if(character1.HP > character2.HP) {
+            DRAW_PLAYER1_WIN();
+        } else if (character2.HP > character1.HP) {
+            DRAW_PLAYER2_WIN();
+        } else {
+            DRAW_OVERTIME();
+            status = 3;
+            time = 601;
+        }
+    }
+    last_status = 4;
+}
+```
+
+* 只在刚进入 4 时画一次胜利画面
+* 如果 HP 一样，则进入加时赛：`status = 3; time = 601;`
+
+---
+
+### status == 5：暂停
+
+```c
+else if (status == 5)
+{
+    TIM2->CR1 &= 0xFFFFFFFE;   // 关掉 TIM2
+}
+```
+
+暂停状态就简单地停掉定时器。
+
+---
+
+## TIM2 中断：计时器逻辑
+
+```c
+void TIM2_IRQHandler(void)
+{
+    if(TIM2->SR & 1<<0)
+    {
+        if(time == -9)
+        {
+            status = 4;
+            TIM2->CR1 &= 0xFFFFFFFE;
+        }
+        else {
+            CLEAR_TIMER();
+            DRAW_TIMER(time);
+            time-=10;
+        }
+    }
+    TIM2->SR &= ~(1<<0);
+}
+```
+
+* `tim2_init(7999, 8999)` 在 72MHz 情况下：
+
+  * 预分频 7999 -> 72MHz / 8000 = 9kHz
+  * 自动重装值 8999 -> 9000 个计数，刚好 1 秒中断一次
+* 每秒：
+
+  * 清除原来的时间显示
+  * 画新的 `time`
+  * `time -= 10`
+* 当 `time == -9` 时，直接 Game Over，关闭 TIM2
+
+> 也就是说，`time` 的单位是“10秒”，初始 `1801` 大致是 180 秒左右（逻辑上）。
+
+---
+
+## EXTI2 中断：KEY2 功能（开始 / 暂停 / 回到首页）
+
+```c
+void EXTI2_IRQHandler(void)
+{
+    EXTI->IMR |= 0<<2;   // 这句其实什么也没干
+    if(status == 0) {
+        last_status = status;
+        status = 2;      // 首页 -> 开始游戏初始化
+    }
+    else if(status == 3) {
+        last_status = status;
+        status = 5;      // 战斗中 -> 暂停
+    }
+    else if(status == 5) {
+        last_status = status;
+        status = 0;      // 暂停 -> 回到首页
+    }
+
+    EXTI->PR = 1<<2;
+    EXTI->IMR |= 1<<2;
+}
+```
+
+* 逻辑意图：用一个按键在「开始游戏」「暂停」「回到首页」之间切换。
+* **注意：** `EXTI->IMR |= 0<<2;` 这一句是完全无效的，你应该是想先关掉中断，应该写成
+  `EXTI->IMR &= ~(1<<2);`
+
+---
+
+## EXTI0 中断：KEY_UP 功能（在主页和说明页之间切换 / 暂停恢复）
+
+```c
+void EXTI0_IRQHandler(void)
+{
+    delay(100);
+    if((GPIOA->IDR |= 0xFFFFFFFE) != 0xFFFFFFFF) {}
+    else {
+        if(status == 0) {
+            last_status = status;
+            status = 1;
+        }
+        else if(status == 1) {
+            last_status = status;
+            status = 0;
+        }
+        else if(status == 5) {
+            last_status = status;
+            status = 3;
+        }
+    }
+    EXTI->PR = 1<<0;
+    EXTI->IMR |= 1<<0;
+}
+```
+
+这里有两个比较明显的问题：
+
+1. `GPIOA->IDR |= 0xFFFFFFFE`
+
+   * `IDR` 是**只读寄存器**，你在这儿用 `|=` 会尝试去写它，语义上是错误的。
+   * 你真正想要的是 **按键消抖+检查按键是否松开**，一般写成类似：
+
+     ```c
+     if ((GPIOA->IDR & (1<<0)) == 0) {   // 低电平按下
+         ...
+     }
+     ```
+   * 你现在这个写法不仅逻辑不对，而且 if 里面还是个空语句 `{}`，相当于什么都没做，所有逻辑都走 `else` 分支。
+
+2. 目前这个检测方式会导致：只要进 EXTI0 中断，基本上都会进到 `else`，也就是无条件在几个 status 之间切换，和实际按键状态无关。
+
+简化后的**正确写法示例**（供你参考）：
+
+```c
+void EXTI0_IRQHandler(void)
+{
+    delay(100); // 简单消抖
+
+    if ((GPIOA->IDR & (1<<0)) == 0) { // 假设按下时为低电平
+        if(status == 0) {
+            last_status = status;
+            status = 1;
+        } else if(status == 1) {
+            last_status = status;
+            status = 0;
+        } else if(status == 5) {
+            last_status = status;
+            status = 3;
+        }
+    }
+
+    EXTI->PR = 1<<0;
+    EXTI->IMR |= 1<<0;
+}
+```
+
+---
+
+## 输入部分的细节（PS/2 + 串口）
+
+### PS/2 键盘
+
+```c
+if(TASKS[0] == 1)
+{
+    TASKS[0] = 3;
+    ps2count = 0;
+    EXTI->IMR |= (1<<11);
+    if (ps2dataReady == 1)
+    {
+        EXTI->IMR &= ~(1<<11);
+        u8 key_data  = (ps2key>>1) & 0xFF;
+        if (kp2_pressed) instruction1 = 1;
+        if (kp8_pressed) instruction1 = 2;
+        if (kp4_pressed) instruction1 = 3;
+        if (kp6_pressed) instruction1 = 4;
+        if (kp9_pressed) instruction1 = 5;
+
+        ps2count = 0;
+        ps2key = 0;
+        ps2dataReady = 0;
+        EXTI->IMR |= (1<<11);
+    }
+    else instruction1 = 0;
+    ...
+}
+```
+
+* `ps2dataReady == 1` 时：
+
+  * 先关 EXTI11
+  * 根据全局宏 `kp*_pressed` 设置 `instruction1`
+  * 清掉 ps2 缓冲，再重新开中断
+* 否则，说明没按键，`instruction1 = 0`
+
+### USART2 收数据（多玩家）
+
+```c
+if(RX_AVAILABLE)
+{
+    val = rx_buf[rx_tail];
+    rx_tail = (rx_tail + 1) % RX_BUFFER_SIZE;
+    if(val ==  0x32  ) instruction2=1;
+    if(val ==  0x38  ) instruction2=2;
+    if(val ==  0x34  ) instruction2=3;
+    if(val ==  0x36  ) instruction2=4;
+    if(val ==  0x39  ) instruction2=5;
+}
+else {
+    instruction2 = 0;
+}
+```
+
+* 从环形缓冲区读一个字节，根据 `'2' '8' '4' '6' '9'` 映射到 1~5 指令
+* 没数据时指令为 0（不动）
+
+---
+
+## 稍微值得注意的点（不是致命 bug，但可以优化）
+
+1. **EXTI0 的按键判断逻辑明显是不对的**
+   上面已经说了，`IDR |=` 必须改成 `&`，不然你完全无法根据真实按键状态来判断。
+
+2. **EXTI2 开/关中断的写法**
+   你应该用：
+
+   ```c
+   EXTI->IMR &= ~(1<<2); // 先关
+   ...
+   EXTI->IMR |= 1<<2;    // 再开
+   ```
+
+   而不是 `|= 0<<2;`
+
+3. **在 status == 3 的 while(1) 内用了大量 delay**
+
+   * `delay(100000);` / `delay(1000000);` 会让一个玩家移动明显慢/卡顿，而且会拖慢整个游戏响应。
+   * 如果后面觉得操作“很卡”、键盘响应慢，这里是重点怀疑对象。
+
+4. **TIM2 在每次进入 status == 3 时都会重新初始化一次**
+   一般问题不大，但如果你在其他地方也初始化 TIM2，要注意重复配置的影响。
+
+---
+
+我已经把整体逻辑和几处明显问题梳理了一遍。
+你接下来是想查 **某个具体 bug**（比如状态切换不对、按键没反应、计时不正常、双人不同步），还是想我帮你 **重构/优化某一块**（比如输入处理、状态机、暂停逻辑）？你可以直接告诉我 “现在的现象是：xxxx”，我就能直接对症改代码。
